@@ -7273,6 +7273,238 @@ describe("Codex app-server provider", () => {
   });
 });
 
+describe("Codex session import", () => {
+  const input = { providerHandleId: "source-thread", cwd: "/workspace/project" };
+  const config = createConfig({ cwd: input.cwd });
+  const context = { config, storedConfig: config };
+
+  function createImportProvider(
+    appServers: FakeCodexAppServer[],
+    options?: Parameters<typeof createProviderWithFakeAppServer>[1],
+  ) {
+    const provider = createProviderWithFakeAppServer(appServers[0]!, options);
+    let nextAppServer = 0;
+    const spawnAppServer = vi.fn(async () => {
+      const appServer = appServers[nextAppServer++];
+      if (!appServer) throw new Error("Unexpected Codex app-server spawn");
+      return appServer.child;
+    });
+    castInternals<{ spawnAppServer: typeof spawnAppServer }>(provider).spawnAppServer =
+      spawnAppServer;
+    return { provider, spawnAppServer };
+  }
+
+  test("imports a fork when the source thread already has an active writer", async () => {
+    const sourceAppServer = createFakeCodexAppServer({
+      "thread/resume": () => {
+        throw new Error("thread source-thread already has an active writer");
+      },
+    });
+    const forkAppServer = createFakeCodexAppServer();
+    const importedAppServer = createFakeCodexAppServer();
+    const { provider, spawnAppServer } = createImportProvider([
+      sourceAppServer,
+      forkAppServer,
+      importedAppServer,
+    ]);
+    const launchContext = { env: { CODEX_HOME: "/custom/codex-home" } };
+
+    const imported = await provider.importSession(input, { ...context, launchContext });
+
+    try {
+      expect(imported.persistence).toEqual({
+        provider: "codex",
+        sessionId: "forked-thread",
+        nativeHandle: "forked-thread",
+        metadata: config,
+      });
+      expect(imported.config).toEqual(config);
+      expect(input.providerHandleId).toBe("source-thread");
+      expect(spawnAppServer).toHaveBeenCalledTimes(3);
+      expect(spawnAppServer).toHaveBeenNthCalledWith(2, launchContext.env);
+      expect(forkAppServer.requests().map((request) => request.method)).toEqual([
+        "initialize",
+        "initialized",
+        "thread/fork",
+      ]);
+      expect(await forkAppServer.waitForRequest("thread/fork")).toEqual({
+        threadId: "source-thread",
+        cwd: input.cwd,
+        excludeTurns: true,
+        persistExtendedHistory: true,
+      });
+      expect(sourceAppServer.child.stdin.writableEnded).toBe(true);
+      expect(forkAppServer.child.stdin.writableEnded).toBe(true);
+      expect(await importedAppServer.waitForRequest("thread/resume")).toMatchObject({
+        threadId: "forked-thread",
+      });
+      sourceAppServer.assertNoErrors();
+      forkAppServer.assertNoErrors();
+      importedAppServer.assertNoErrors();
+    } finally {
+      await imported.session.close();
+    }
+  });
+
+  test("finds an active writer in the cause chain and forks with the custom provider", async () => {
+    const forkAppServer = createFakeCodexAppServer();
+    const importedAppServer = createFakeCodexAppServer();
+    const { provider } = createImportProvider([forkAppServer, importedAppServer], {
+      runtimeSettings: {
+        env: { OPENAI_BASE_URL: "https://llm.example.test/v1", OPENAI_API_KEY: "test-key" },
+      },
+      customProvider: { id: "my-codex", label: "My Codex", extends: "codex" },
+    });
+    vi.spyOn(provider, "resumeSession").mockRejectedValueOnce(
+      new Error("Import failed", {
+        cause: new Error("Failed to resume Codex thread source-thread: resume failed", {
+          cause: new Error("thread source-thread already has an active writer"),
+        }),
+      }),
+    );
+
+    const imported = await provider.importSession(input, context);
+
+    try {
+      expect(imported.persistence.sessionId).toBe("forked-thread");
+      expect(await forkAppServer.waitForRequest("thread/fork")).toEqual({
+        threadId: "source-thread",
+        cwd: input.cwd,
+        excludeTurns: true,
+        persistExtendedHistory: true,
+        modelProvider: "paseo:my-codex",
+        config: {
+          model_provider: "paseo:my-codex",
+          model_providers: {
+            "paseo:my-codex": {
+              name: "My Codex",
+              base_url: "https://llm.example.test/v1",
+              wire_api: "responses",
+              env_key: "OPENAI_API_KEY",
+              requires_openai_auth: false,
+            },
+          },
+        },
+      });
+      expect(forkAppServer.child.stdin.writableEnded).toBe(true);
+      forkAppServer.assertNoErrors();
+      importedAppServer.assertNoErrors();
+    } finally {
+      await imported.session.close();
+    }
+  });
+
+  test("propagates other import errors unchanged without forking", async () => {
+    const appServer = createFakeCodexAppServer();
+    const { provider, spawnAppServer } = createImportProvider([appServer]);
+    const importError = new Error("thread source-thread not found");
+    const resumeSession = vi.spyOn(provider, "resumeSession").mockRejectedValue(importError);
+
+    await expect(provider.importSession(input, context)).rejects.toBe(importError);
+
+    expect(resumeSession).toHaveBeenCalledTimes(1);
+    expect(spawnAppServer).not.toHaveBeenCalled();
+    expect(appServer.requests()).toEqual([]);
+  });
+
+  test("does not fork for an active-writer error without the resume wrapper", async () => {
+    const appServer = createFakeCodexAppServer();
+    const { provider, spawnAppServer } = createImportProvider([appServer]);
+    const importError = new Error("thread source-thread already has an active writer");
+    const resumeSession = vi.spyOn(provider, "resumeSession").mockRejectedValue(importError);
+
+    await expect(provider.importSession(input, context)).rejects.toBe(importError);
+
+    expect(resumeSession).toHaveBeenCalledTimes(1);
+    expect(spawnAppServer).not.toHaveBeenCalled();
+    expect(appServer.requests()).toEqual([]);
+  });
+
+  test.each([
+    {
+      failure: "the fork request fails",
+      fork: () => {
+        throw new Error("Fork failed");
+      },
+    },
+    {
+      failure: "the fork returns the source thread id",
+      fork: () => ({
+        thread: { id: "source-thread" },
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        serviceTier: null,
+        cwd: input.cwd,
+        approvalPolicy: "on-request",
+        approvalsReviewer: null,
+        sandbox: { type: "workspaceWrite", networkAccess: false },
+      }),
+    },
+    {
+      failure: "the fork returns an empty thread id",
+      fork: () => ({
+        thread: { id: "" },
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        serviceTier: null,
+        cwd: input.cwd,
+        approvalPolicy: "on-request",
+        approvalsReviewer: null,
+        sandbox: { type: "workspaceWrite", networkAccess: false },
+      }),
+    },
+  ])("preserves the original import error when $failure", async ({ fork }) => {
+    const appServer = createFakeCodexAppServer({ "thread/fork": fork });
+    const { provider, spawnAppServer } = createImportProvider([appServer]);
+    const importError = new Error(
+      "Failed to resume Codex thread source-thread: thread source-thread already has an active writer",
+      { cause: new Error("thread source-thread already has an active writer") },
+    );
+    const resumeSession = vi.spyOn(provider, "resumeSession").mockRejectedValue(importError);
+
+    await expect(provider.importSession(input, context)).rejects.toBe(importError);
+
+    expect(resumeSession).toHaveBeenCalledTimes(1);
+    expect(spawnAppServer).toHaveBeenCalledTimes(1);
+    expect(appServer.requests().filter((request) => request.method === "thread/fork")).toHaveLength(
+      1,
+    );
+    expect(appServer.child.stdin.writableEnded).toBe(true);
+    appServer.assertNoErrors();
+  });
+
+  test("propagates a failed forked import without another fork", async () => {
+    const appServer = createFakeCodexAppServer();
+    const { provider, spawnAppServer } = createImportProvider([appServer]);
+    const importError = new Error(
+      "Failed to resume Codex thread source-thread: thread source-thread already has an active writer",
+      { cause: new Error("thread source-thread already has an active writer") },
+    );
+    const forkedImportError = new Error(
+      "Failed to resume Codex thread forked-thread: thread forked-thread already has an active writer",
+      { cause: new Error("thread forked-thread already has an active writer") },
+    );
+    const resumeSession = vi
+      .spyOn(provider, "resumeSession")
+      .mockRejectedValueOnce(importError)
+      .mockRejectedValue(forkedImportError);
+
+    await expect(provider.importSession(input, context)).rejects.toBe(forkedImportError);
+
+    expect(resumeSession).toHaveBeenCalledTimes(2);
+    expect(resumeSession.mock.calls.map(([handle]) => handle.sessionId)).toEqual([
+      "source-thread",
+      "forked-thread",
+    ]);
+    expect(spawnAppServer).toHaveBeenCalledTimes(1);
+    expect(appServer.requests().filter((request) => request.method === "thread/fork")).toHaveLength(
+      1,
+    );
+    expect(appServer.child.stdin.writableEnded).toBe(true);
+    appServer.assertNoErrors();
+  });
+});
+
 describe("Codex importable sessions", () => {
   const CODEX_THREAD_PAGE_CAP = 100;
 

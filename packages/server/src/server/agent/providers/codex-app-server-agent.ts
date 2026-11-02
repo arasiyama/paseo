@@ -7627,12 +7627,76 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
-    return importSessionFromPersistence({
-      provider: CODEX_PROVIDER,
-      request: input,
-      context,
-      resumeSession: this.resumeSession.bind(this),
-    });
+    try {
+      return await importSessionFromPersistence({
+        provider: CODEX_PROVIDER,
+        request: input,
+        context,
+        resumeSession: this.resumeSession.bind(this),
+      });
+    } catch (error) {
+      const seen = new Set<unknown>();
+      let isActiveWriterError = false;
+      let isResumeError = false;
+      for (let cause: unknown = error; cause && !seen.has(cause); ) {
+        seen.add(cause);
+        const record = toObjectRecord(cause);
+        const message = typeof record?.message === "string" ? record.message : String(cause);
+        if (message.includes("already has an active writer")) {
+          isActiveWriterError = true;
+        }
+        if (message.includes("Failed to resume Codex thread")) {
+          isResumeError = true;
+        }
+        cause = record?.cause;
+      }
+      if (!isActiveWriterError || !isResumeError) {
+        throw error;
+      }
+
+      let forkedThreadId: string;
+      try {
+        const child = await this.spawnAppServer(context.launchContext?.env);
+        const client =
+          this.deps._createCodexClient?.(child, this.logger, () => ({})) ??
+          new CodexAppServerClient(child, this.logger);
+        try {
+          await client.request("initialize", buildCodexAppServerInitializeParams());
+          client.notify("initialized", {});
+          const customProviderConfig = this.customProviderConfig();
+          const forked = await forkCodexThread(client, {
+            threadId: input.providerHandleId,
+            cwd: input.cwd,
+            excludeTurns: true,
+            persistExtendedHistory: true,
+            ...(customProviderConfig
+              ? {
+                  modelProvider: customProviderConfig.model_provider,
+                  config: { ...customProviderConfig },
+                }
+              : {}),
+          });
+          forkedThreadId = forked.thread.id;
+        } finally {
+          await client.dispose();
+        }
+      } catch {
+        throw error;
+      }
+      if (!forkedThreadId || forkedThreadId === input.providerHandleId) {
+        throw error;
+      }
+      this.logger.info(
+        { sourceThreadId: input.providerHandleId, forkedThreadId },
+        "Codex session import fell back to a fork because the thread already has an active writer",
+      );
+      return importSessionFromPersistence({
+        provider: CODEX_PROVIDER,
+        request: { ...input, providerHandleId: forkedThreadId },
+        context,
+        resumeSession: this.resumeSession.bind(this),
+      });
+    }
   }
 
   async getCatalogCacheKey(_options: FetchCatalogOptions): Promise<string> {
