@@ -7326,6 +7326,7 @@ describe("Codex session import", () => {
         "initialize",
         "initialized",
         "thread/fork",
+        "thread/read",
       ]);
       expect(await forkAppServer.waitForRequest("thread/fork")).toEqual({
         threadId: "source-thread",
@@ -7338,6 +7339,122 @@ describe("Codex session import", () => {
       expect(await importedAppServer.waitForRequest("thread/resume")).toMatchObject({
         threadId: "forked-thread",
       });
+      sourceAppServer.assertNoErrors();
+      forkAppServer.assertNoErrors();
+      importedAppServer.assertNoErrors();
+    } finally {
+      await imported.session.close();
+    }
+  });
+
+  test("names the fork after the source thread and titles the import with it", async () => {
+    const sourceAppServer = createFakeCodexAppServer({
+      "thread/resume": () => {
+        throw new Error("thread source-thread already has an active writer");
+      },
+    });
+    const forkAppServer = createFakeCodexAppServer({
+      "thread/read": () => ({
+        thread: { id: "source-thread", name: "  My chat title  ", turns: [] },
+      }),
+      "thread/name/set": () => ({}),
+    });
+    const importedAppServer = createFakeCodexAppServer();
+    const { provider } = createImportProvider([sourceAppServer, forkAppServer, importedAppServer]);
+
+    const imported = await provider.importSession(input, context);
+
+    try {
+      expect(await forkAppServer.waitForRequest("thread/name/set")).toEqual({
+        threadId: "forked-thread",
+        name: "My chat title",
+      });
+      expect(imported.config).toEqual({ ...config, title: "My chat title" });
+      sourceAppServer.assertNoErrors();
+      forkAppServer.assertNoErrors();
+      importedAppServer.assertNoErrors();
+    } finally {
+      await imported.session.close();
+    }
+  });
+
+  test("leaves the fork unnamed when the source thread has no name", async () => {
+    const sourceAppServer = createFakeCodexAppServer({
+      "thread/resume": () => {
+        throw new Error("thread source-thread already has an active writer");
+      },
+    });
+    const forkAppServer = createFakeCodexAppServer({
+      "thread/read": () => ({ thread: { id: "source-thread", name: null, turns: [] } }),
+    });
+    const importedAppServer = createFakeCodexAppServer();
+    const { provider } = createImportProvider([sourceAppServer, forkAppServer, importedAppServer]);
+
+    const imported = await provider.importSession(input, context);
+
+    try {
+      expect(forkAppServer.requests().some((request) => request.method === "thread/name/set")).toBe(
+        false,
+      );
+      expect(imported.config).toEqual(config);
+      sourceAppServer.assertNoErrors();
+      forkAppServer.assertNoErrors();
+      importedAppServer.assertNoErrors();
+    } finally {
+      await imported.session.close();
+    }
+  });
+
+  test("still imports with the source title when naming the fork fails", async () => {
+    const sourceAppServer = createFakeCodexAppServer({
+      "thread/resume": () => {
+        throw new Error("thread source-thread already has an active writer");
+      },
+    });
+    const forkAppServer = createFakeCodexAppServer({
+      "thread/read": () => ({
+        thread: { id: "source-thread", name: "My chat title", turns: [] },
+      }),
+      "thread/name/set": () => {
+        throw new Error("thread/name/set is not supported");
+      },
+    });
+    const importedAppServer = createFakeCodexAppServer();
+    const { provider } = createImportProvider([sourceAppServer, forkAppServer, importedAppServer]);
+
+    const imported = await provider.importSession(input, context);
+
+    try {
+      expect(imported.config).toEqual({ ...config, title: "My chat title" });
+      sourceAppServer.assertNoErrors();
+      forkAppServer.assertNoErrors();
+      importedAppServer.assertNoErrors();
+    } finally {
+      await imported.session.close();
+    }
+  });
+
+  test("still imports when reading the source thread fails", async () => {
+    const sourceAppServer = createFakeCodexAppServer({
+      "thread/resume": () => {
+        throw new Error("thread source-thread already has an active writer");
+      },
+    });
+    const forkAppServer = createFakeCodexAppServer({
+      "thread/read": () => {
+        throw new Error("thread/read blew up");
+      },
+    });
+    const importedAppServer = createFakeCodexAppServer();
+    const { provider } = createImportProvider([sourceAppServer, forkAppServer, importedAppServer]);
+
+    const imported = await provider.importSession(input, context);
+
+    try {
+      expect(forkAppServer.requests().some((request) => request.method === "thread/name/set")).toBe(
+        false,
+      );
+      expect(imported.config).toEqual(config);
       sourceAppServer.assertNoErrors();
       forkAppServer.assertNoErrors();
       importedAppServer.assertNoErrors();

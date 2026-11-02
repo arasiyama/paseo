@@ -2165,6 +2165,27 @@ export async function forkCodexThread(
   return parseCodexThreadForkResponse(await client.request("thread/fork", params));
 }
 
+// True when the error chain is a resume that failed because another Codex
+// client holds the thread's single-writer lock.
+function isWriterLockedResume(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let isActiveWriterError = false;
+  let isResumeError = false;
+  for (let cause: unknown = error; cause && !seen.has(cause); ) {
+    seen.add(cause);
+    const record = toObjectRecord(cause);
+    const message = typeof record?.message === "string" ? record.message : String(cause);
+    if (message.includes("already has an active writer")) {
+      isActiveWriterError = true;
+    }
+    if (message.includes("Failed to resume Codex thread")) {
+      isResumeError = true;
+    }
+    cause = record?.cause;
+  }
+  return isActiveWriterError && isResumeError;
+}
+
 export async function rollbackCodexThread(
   client: CodexAppServerClientLike,
   params: CodexThreadRollbackParams,
@@ -7635,67 +7656,111 @@ export class CodexAppServerAgentClient implements AgentClient {
         resumeSession: this.resumeSession.bind(this),
       });
     } catch (error) {
-      const seen = new Set<unknown>();
-      let isActiveWriterError = false;
-      let isResumeError = false;
-      for (let cause: unknown = error; cause && !seen.has(cause); ) {
-        seen.add(cause);
-        const record = toObjectRecord(cause);
-        const message = typeof record?.message === "string" ? record.message : String(cause);
-        if (message.includes("already has an active writer")) {
-          isActiveWriterError = true;
-        }
-        if (message.includes("Failed to resume Codex thread")) {
-          isResumeError = true;
-        }
-        cause = record?.cause;
-      }
-      if (!isActiveWriterError || !isResumeError) {
+      if (!isWriterLockedResume(error)) {
         throw error;
       }
+      return this.importViaFork(input, context, error);
+    }
+  }
 
-      let forkedThreadId: string;
+  // The source thread is still open in another Codex client, which holds the
+  // single-writer lock, so resume cannot work. Fork the thread with a
+  // temporary app-server (fork reads the persisted rollout and needs no
+  // writer) and import the fork instead. Any failure rethrows the original
+  // resume error.
+  private async importViaFork(
+    input: ImportProviderSessionInput,
+    context: ImportProviderSessionContext,
+    originalError: unknown,
+  ) {
+    let forkedThreadId = "";
+    let forkTitle: { title: string; fromSource: boolean } | undefined;
+    try {
+      const child = await this.spawnAppServer(context.launchContext?.env);
+      const client =
+        this.deps._createCodexClient?.(child, this.logger, () => ({})) ??
+        new CodexAppServerClient(child, this.logger);
       try {
-        const child = await this.spawnAppServer(context.launchContext?.env);
-        const client =
-          this.deps._createCodexClient?.(child, this.logger, () => ({})) ??
-          new CodexAppServerClient(child, this.logger);
-        try {
-          await client.request("initialize", buildCodexAppServerInitializeParams());
-          client.notify("initialized", {});
-          const customProviderConfig = this.customProviderConfig();
-          const forked = await forkCodexThread(client, {
-            threadId: input.providerHandleId,
-            cwd: input.cwd,
-            excludeTurns: true,
-            persistExtendedHistory: true,
-            ...(customProviderConfig
-              ? {
-                  modelProvider: customProviderConfig.model_provider,
-                  config: { ...customProviderConfig },
-                }
-              : {}),
-          });
-          forkedThreadId = forked.thread.id;
-        } finally {
-          await client.dispose();
+        await client.request("initialize", buildCodexAppServerInitializeParams());
+        client.notify("initialized", {});
+        const customProviderConfig = this.customProviderConfig();
+        const forked = await forkCodexThread(client, {
+          threadId: input.providerHandleId,
+          cwd: input.cwd,
+          excludeTurns: true,
+          persistExtendedHistory: true,
+          ...(customProviderConfig
+            ? {
+                modelProvider: customProviderConfig.model_provider,
+                config: { ...customProviderConfig },
+              }
+            : {}),
+        });
+        forkedThreadId = forked.thread.id;
+        if (forkedThreadId && forkedThreadId !== input.providerHandleId) {
+          forkTitle = await this.resolveForkTitle(client, input.providerHandleId, context);
+          if (forkTitle) {
+            await this.nameFork(client, forkedThreadId, forkTitle.title);
+          }
         }
-      } catch {
-        throw error;
+      } finally {
+        await client.dispose();
       }
-      if (!forkedThreadId || forkedThreadId === input.providerHandleId) {
-        throw error;
-      }
-      this.logger.info(
-        { sourceThreadId: input.providerHandleId, forkedThreadId },
-        "Codex session import fell back to a fork because the thread already has an active writer",
+    } catch {
+      throw originalError;
+    }
+    if (!forkedThreadId || forkedThreadId === input.providerHandleId) {
+      throw originalError;
+    }
+    this.logger.info(
+      { sourceThreadId: input.providerHandleId, forkedThreadId },
+      "Codex session import fell back to a fork because the thread already has an active writer",
+    );
+    return importSessionFromPersistence({
+      provider: CODEX_PROVIDER,
+      request: { ...input, providerHandleId: forkedThreadId },
+      context,
+      resumeSession: this.resumeSession.bind(this),
+      ...(forkTitle?.fromSource ? { config: { title: forkTitle.title } } : {}),
+    });
+  }
+
+  private async nameFork(
+    client: CodexAppServerClientLike,
+    forkedThreadId: string,
+    title: string,
+  ): Promise<void> {
+    try {
+      await client.request("thread/name/set", { threadId: forkedThreadId, name: title });
+    } catch (renameError) {
+      this.logger.debug(
+        { err: renameError, forkedThreadId },
+        "Failed to name forked Codex thread after import fallback",
       );
-      return importSessionFromPersistence({
-        provider: CODEX_PROVIDER,
-        request: { ...input, providerHandleId: forkedThreadId },
-        context,
-        resumeSession: this.resumeSession.bind(this),
-      });
+    }
+  }
+
+  // thread/fork does not copy the source thread's name, so a forked import would
+  // lose its title. Prefer a title the import already carries; otherwise read
+  // the source thread's name (best-effort: any failure means no title).
+  private async resolveForkTitle(
+    client: CodexAppServerClientLike,
+    sourceThreadId: string,
+    context: ImportProviderSessionContext,
+  ): Promise<{ title: string; fromSource: boolean } | undefined> {
+    const explicit = context.config.title ?? context.storedConfig.title;
+    if (typeof explicit === "string" && explicit.trim()) {
+      return { title: explicit.trim(), fromSource: false };
+    }
+    try {
+      const read = toObjectRecord(
+        await client.request("thread/read", { threadId: sourceThreadId }),
+      );
+      const thread = toObjectRecord(read?.thread);
+      const name = typeof thread?.name === "string" ? thread.name.trim() : "";
+      return name ? { title: name, fromSource: true } : undefined;
+    } catch {
+      return undefined;
     }
   }
 
